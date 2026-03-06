@@ -12,15 +12,13 @@ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
 import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
 import { TrackEnum } from '@gitroom/nestjs-libraries/user/track.enum';
 
-// Adiciona isto ANTES da linha do 'const stripe = new Stripe(...)'
 if (!process.env.STRIPE_SECRET_KEY) {
   console.log('Stripe disabled - skipping initialization (no key provided)');
-  return;  // Agora o return está dentro de uma função (construtor ou método)
+  return;
 }
 
-// Atualiza a apiVersion para compatível com versões recentes
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',  // ou '2025-01-01' se a versão do Stripe for mais nova; testa '2026-02-25.clover' se der erro
+  apiVersion: '2024-06-20',
 });
 
 @Injectable()
