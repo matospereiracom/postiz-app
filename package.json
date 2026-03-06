@@ -27,8 +27,8 @@
   "dev:backend": "rm -rf apps/backend/dist && pnpm --filter ./apps/backend run dev",
   "dev:frontend": "rm -rf apps/frontend/dist && pnpm --filter ./apps/frontend run dev",
   "dev:orchestrator": "rm -rf apps/orchestrator/dist && pnpm --filter ./apps/orchestrator run dev",
-  "start": "pnpm run pm2-run",  // <- este é o script principal para start (roda PM2 com todos os processos)
-  "start:prod": "pnpm run pm2-run",  // para produção
+  "start": "pnpm run pm2-run",
+  "start:prod": "pnpm run pm2-run",
   "start:prod:orchestrator": "pnpm --filter ./apps/orchestrator run start",
   "start:prod:backend": "pnpm --filter ./apps/backend run start",
   "start:prod:frontend": "pnpm --filter ./apps/frontend run start",
