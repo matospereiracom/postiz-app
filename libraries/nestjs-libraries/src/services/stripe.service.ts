@@ -12,25 +12,31 @@ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
 import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
 import { TrackEnum } from '@gitroom/nestjs-libraries/user/track.enum';
 
-if (!process.env.STRIPE_SECRET_KEY) {
-  console.log('Stripe disabled - skipping initialization (no key provided)');
-  return;
-}
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
-});
-
 @Injectable()
 export class StripeService {
+  private stripe: Stripe | null = null;
+
   constructor(
     private _subscriptionService: SubscriptionService,
     private _organizationService: OrganizationService,
     private _userService: UsersService,
     private _trackService: TrackService
-  ) {}
+  ) {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      console.log('Stripe disabled - skipping initialization (no key provided)');
+      return;
+    }
+
+    this.stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+      apiVersion: '2025-01-01',
+    });
+  }
+
   validateRequest(rawBody: Buffer, signature: string, endpointSecret: string) {
-    return stripe.webhooks.constructEvent(rawBody, signature, endpointSecret);
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+    return this.stripe.webhooks.constructEvent(rawBody, signature, endpointSecret);
   }
 
   async checkValidCard(
@@ -38,6 +44,10 @@ export class StripeService {
       | Stripe.CustomerSubscriptionCreatedEvent
       | Stripe.CustomerSubscriptionUpdatedEvent
   ) {
+    if (!this.stripe) {
+      return false;
+    }
+
     if (event.data.object.status === 'incomplete') {
       return false;
     }
@@ -53,7 +63,7 @@ export class StripeService {
 
     console.log('Checking card');
 
-    const paymentMethods = await stripe.paymentMethods.list({
+    const paymentMethods = await this.stripe.paymentMethods.list({
       customer: event.data.object.customer as string,
     });
 
@@ -73,7 +83,7 @@ export class StripeService {
     }
 
     try {
-      const paymentIntent = await stripe.paymentIntents.create({
+      const paymentIntent = await this.stripe.paymentIntents.create({
         amount: 100,
         currency: 'usd',
         payment_method: latestMethod.id,
@@ -88,17 +98,17 @@ export class StripeService {
 
       if (paymentIntent.status !== 'requires_capture') {
         console.error('Cant charge');
-        await stripe.paymentMethods.detach(paymentMethods.data[0].id);
-        await stripe.subscriptions.cancel(event.data.object.id as string);
+        await this.stripe.paymentMethods.detach(paymentMethods.data[0].id);
+        await this.stripe.subscriptions.cancel(event.data.object.id as string);
         return false;
       }
 
-      await stripe.paymentIntents.cancel(paymentIntent.id as string);
+      await this.stripe.paymentIntents.cancel(paymentIntent.id as string);
       return true;
     } catch (err) {
       try {
-        await stripe.paymentMethods.detach(paymentMethods.data[0].id);
-        await stripe.subscriptions.cancel(event.data.object.id as string);
+        await this.stripe.paymentMethods.detach(paymentMethods.data[0].id);
+        await this.stripe.subscriptions.cancel(event.data.object.id as string);
       } catch (err) {
         /*dont do anything*/
       }
@@ -107,6 +117,10 @@ export class StripeService {
   }
 
   async createSubscription(event: Stripe.CustomerSubscriptionCreatedEvent) {
+    if (!this.stripe) {
+      return { ok: false };
+    }
+
     const {
       uniqueId,
       billing,
@@ -136,7 +150,12 @@ export class StripeService {
       event.data.object.cancel_at
     );
   }
+
   async updateSubscription(event: Stripe.CustomerSubscriptionUpdatedEvent) {
+    if (!this.stripe) {
+      return { ok: false };
+    }
+
     const {
       uniqueId,
       billing,
@@ -170,12 +189,16 @@ export class StripeService {
   }
 
   async createOrGetCustomer(organization: Organization) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     if (organization.paymentId) {
       return organization.paymentId;
     }
 
     const users = await this._organizationService.getTeam(organization.id);
-    const customer = await stripe.customers.create({
+    const customer = await this.stripe.customers.create({
       email: users.users[0].user.email,
       name: organization.name,
     });
@@ -187,7 +210,11 @@ export class StripeService {
   }
 
   async getPackages() {
-    const products = await stripe.prices.list({
+    if (!this.stripe) {
+      return {};
+    }
+
+    const products = await this.stripe.prices.list({
       active: true,
       expand: ['data.tiers', 'data.product'],
       lookup_keys: [
@@ -211,10 +238,14 @@ export class StripeService {
   }
 
   async prorate(organizationId: string, body: BillingSubscribeDto) {
+    if (!this.stripe) {
+      return { price: 0 };
+    }
+
     const org = await this._organizationService.getOrgById(organizationId);
     const customer = await this.createOrGetCustomer(org!);
     const priceData = pricing[body.billing];
-    const allProducts = await stripe.products.list({
+    const allProducts = await this.stripe.products.list({
       active: true,
       expand: ['data.prices'],
     });
@@ -223,12 +254,12 @@ export class StripeService {
       allProducts.data.find(
         (product) => product.name.toUpperCase() === body.billing.toUpperCase()
       ) ||
-      (await stripe.products.create({
+      (await this.stripe.products.create({
         active: true,
         name: body.billing,
       }));
 
-    const pricesList = await stripe.prices.list({
+    const pricesList = await this.stripe.prices.list({
       active: true,
       product: findProduct!.id,
     });
@@ -238,14 +269,13 @@ export class StripeService {
         (p) =>
           p?.recurring?.interval?.toLowerCase() ===
             (body.period === 'MONTHLY' ? 'month' : 'year') &&
-          p?.nickname === body.billing + ' ' + body.period &&
           p?.unit_amount ===
             (body.period === 'MONTHLY'
               ? priceData.month_price
               : priceData.year_price) *
               100
       ) ||
-      (await stripe.prices.create({
+      (await this.stripe.prices.create({
         active: true,
         product: findProduct!.id,
         currency: 'usd',
@@ -263,7 +293,7 @@ export class StripeService {
 
     const currentUserSubscription = {
       data: (
-        await stripe.subscriptions.list({
+        await this.stripe.subscriptions.list({
           customer,
           status: 'all',
         })
@@ -271,7 +301,7 @@ export class StripeService {
     };
 
     try {
-      const price = await stripe.invoices.createPreview({
+      const price = await this.stripe.invoices.createPreview({
         customer,
         subscription: currentUserSubscription?.data?.[0]?.id,
         subscription_details: {
@@ -297,21 +327,29 @@ export class StripeService {
   }
 
   async getCustomerSubscriptions(organizationId: string) {
+    if (!this.stripe) {
+      return { data: [] };
+    }
+
     const org = (await this._organizationService.getOrgById(organizationId))!;
     const customer = org.paymentId;
-    return stripe.subscriptions.list({
+    return this.stripe.subscriptions.list({
       customer: customer!,
       status: 'all',
     });
   }
 
   async setToCancel(organizationId: string) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const id = makeId(10);
     const org = await this._organizationService.getOrgById(organizationId);
     const customer = await this.createOrGetCustomer(org!);
     const currentUserSubscription = {
       data: (
-        await stripe.subscriptions.list({
+        await this.stripe.subscriptions.list({
           customer,
           status: 'all',
           expand: ['data.latest_invoice'],
@@ -323,7 +361,7 @@ export class StripeService {
 
     // If the user is toggling back (un-cancelling), just remove the cancel
     if (sub.cancel_at_period_end) {
-      const { cancel_at } = await stripe.subscriptions.update(sub.id, {
+      const { cancel_at } = await this.stripe.subscriptions.update(sub.id, {
         cancel_at_period_end: false,
         metadata: { service: 'gitroom', id },
       });
@@ -343,7 +381,7 @@ export class StripeService {
 
     if (hasFailedPayment) {
       // Payment already failed — cancel immediately and delete subscription
-      await stripe.subscriptions.cancel(sub.id);
+      await this.stripe.subscriptions.cancel(sub.id);
       await this._subscriptionService.deleteSubscription(customer);
 
       return {
@@ -353,7 +391,7 @@ export class StripeService {
     }
 
     // Payment succeeded — cancel at end of billing period
-    const { cancel_at } = await stripe.subscriptions.update(sub.id, {
+    const { cancel_at } = await this.stripe.subscriptions.update(sub.id, {
       cancel_at_period_end: true,
       metadata: { service: 'gitroom', id },
     });
@@ -370,7 +408,11 @@ export class StripeService {
   }
 
   async createBillingPortalLink(customer: string) {
-    return stripe.billingPortal.sessions.create({
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
+    return this.stripe.billingPortal.sessions.create({
       customer,
       return_url: process.env['FRONTEND_URL'] + '/billing',
     });
@@ -382,8 +424,12 @@ export class StripeService {
    * Returns the promotion code string (not the ID) for frontend auto-apply
    */
   private async findAutoApplyPromotionCode(): Promise<string | null> {
+    if (!this.stripe) {
+      return null;
+    }
+
     try {
-      const promotionCodes = await stripe.promotionCodes.list({
+      const promotionCodes = await this.stripe.promotionCodes.list({
         active: true,
         limit: 100,
       });
@@ -437,10 +483,14 @@ export class StripeService {
     userId: string,
     allowTrial: boolean
   ) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const user = await this._userService.getUserById(userId);
 
     try {
-      await stripe.customers.update(customer, {
+      await this.stripe.customers.update(customer, {
         email: user.email,
         ...(body.dub
           ? {
@@ -460,7 +510,7 @@ export class StripeService {
     }
 
     const isUtm = body.utm ? `&utm_source=${body.utm}` : '';
-    const { client_secret } = await stripe.checkout.sessions.create({
+    const { client_secret } = await this.stripe.checkout.sessions.create({
       ui_mode: 'custom',
       customer,
       return_url:
@@ -510,10 +560,14 @@ export class StripeService {
     userId: string,
     allowTrial: boolean
   ) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const isUtm = body.utm ? `&utm_source=${body.utm}` : '';
 
     if (body.dub) {
-      await stripe.customers.update(customer, {
+      await this.stripe.customers.update(customer, {
         metadata: {
           dubCustomerExternalId: userId,
           dubClickId: body.dub,
@@ -521,7 +575,7 @@ export class StripeService {
       });
     }
 
-    const { url } = await stripe.checkout.sessions.create({
+    const { url } = await this.stripe.checkout.sessions.create({
       customer,
       cancel_url: process.env['FRONTEND_URL'] + `/billing?cancel=true${isUtm}`,
       success_url:
@@ -551,23 +605,27 @@ export class StripeService {
   }
 
   async finishTrial(paymentId: string) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const list = (
-      await stripe.subscriptions.list({
+      await this.stripe.subscriptions.list({
         customer: paymentId,
       })
     ).data.filter((f) => f.status === 'trialing');
 
-    return stripe.subscriptions.update(list[0].id, {
+    return this.stripe.subscriptions.update(list[0].id, {
       trial_end: 'now',
     });
   }
 
   async checkDiscount(customer: string) {
-    if (!process.env.STRIPE_DISCOUNT_ID) {
+    if (!this.stripe || !process.env.STRIPE_DISCOUNT_ID) {
       return false;
     }
 
-    const list = await stripe.charges.list({
+    const list = await this.stripe.charges.list({
       customer,
       limit: 1,
     });
@@ -578,7 +636,7 @@ export class StripeService {
 
     const currentUserSubscription = {
       data: (
-        await stripe.subscriptions.list({
+        await this.stripe.subscriptions.list({
           customer,
           status: 'all',
           expand: ['data.discounts'],
@@ -602,6 +660,10 @@ export class StripeService {
   }
 
   async applyDiscount(customer: string) {
+    if (!this.stripe) {
+      return false;
+    }
+
     const check = this.checkDiscount(customer);
     if (!check) {
       return false;
@@ -609,7 +671,7 @@ export class StripeService {
 
     const currentUserSubscription = {
       data: (
-        await stripe.subscriptions.list({
+        await this.stripe.subscriptions.list({
           customer,
           status: 'all',
           expand: ['data.discounts'],
@@ -617,7 +679,7 @@ export class StripeService {
       ).data.find((f) => f.status === 'active' || f.status === 'trialing'),
     };
 
-    await stripe.subscriptions.update(currentUserSubscription.data.id, {
+    await this.stripe.subscriptions.update(currentUserSubscription.data.id, {
       discounts: [
         {
           coupon: process.env.STRIPE_DISCOUNT_ID!,
@@ -663,11 +725,15 @@ export class StripeService {
     body: BillingSubscribeDto,
     allowTrial: boolean
   ) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const id = makeId(10);
     const priceData = pricing[body.billing];
     const org = await this._organizationService.getOrgById(organizationId);
     const customer = await this.createOrGetCustomer(org!);
-    const allProducts = await stripe.products.list({
+    const allProducts = await this.stripe.products.list({
       active: true,
       expand: ['data.prices'],
     });
@@ -676,12 +742,12 @@ export class StripeService {
       allProducts.data.find(
         (product) => product.name.toUpperCase() === body.billing.toUpperCase()
       ) ||
-      (await stripe.products.create({
+      (await this.stripe.products.create({
         active: true,
         name: body.billing,
       }));
 
-    const pricesList = await stripe.prices.list({
+    const pricesList = await this.stripe.prices.list({
       active: true,
       product: findProduct!.id,
     });
@@ -697,7 +763,7 @@ export class StripeService {
               : priceData.year_price) *
               100
       ) ||
-      (await stripe.prices.create({
+      (await this.stripe.prices.create({
         active: true,
         product: findProduct!.id,
         currency: 'usd',
@@ -729,11 +795,15 @@ export class StripeService {
     body: BillingSubscribeDto,
     allowTrial: boolean
   ) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const id = makeId(10);
     const priceData = pricing[body.billing];
     const org = await this._organizationService.getOrgById(organizationId);
     const customer = await this.createOrGetCustomer(org!);
-    const allProducts = await stripe.products.list({
+    const allProducts = await this.stripe.products.list({
       active: true,
       expand: ['data.prices'],
     });
@@ -742,12 +812,12 @@ export class StripeService {
       allProducts.data.find(
         (product) => product.name.toUpperCase() === body.billing.toUpperCase()
       ) ||
-      (await stripe.products.create({
+      (await this.stripe.products.create({
         active: true,
         name: body.billing,
       }));
 
-    const pricesList = await stripe.prices.list({
+    const pricesList = await this.stripe.prices.list({
       active: true,
       product: findProduct!.id,
     });
@@ -763,7 +833,7 @@ export class StripeService {
               : priceData.year_price) *
               100
       ) ||
-      (await stripe.prices.create({
+      (await this.stripe.prices.create({
         active: true,
         product: findProduct!.id,
         currency: 'usd',
@@ -794,7 +864,7 @@ export class StripeService {
 
     const currentUserSubscription = {
       data: (
-        await stripe.subscriptions.list({
+        await this.stripe.subscriptions.list({
           customer,
           status: 'all',
         })
@@ -802,7 +872,7 @@ export class StripeService {
     };
 
     try {
-      await stripe.subscriptions.update(currentUserSubscription.data[0].id, {
+      await this.stripe.subscriptions.update(currentUserSubscription.data[0].id, {
         cancel_at_period_end: false,
         metadata: {
           service: 'gitroom',
@@ -831,13 +901,17 @@ export class StripeService {
   }
 
   async paymentSucceeded(event: Stripe.InvoicePaymentSucceededEvent) {
+    if (!this.stripe) {
+      return { ok: true };
+    }
+
     // get subscription from payment
     const subscriptionId =
       event.data.object.parent?.subscription_details?.subscription;
     if (!subscriptionId) {
       return { ok: true };
     }
-    const subscription = await stripe.subscriptions.retrieve(
+    const subscription = await this.stripe.subscriptions.retrieve(
       typeof subscriptionId === 'string' ? subscriptionId : subscriptionId.id
     );
 
@@ -853,12 +927,16 @@ export class StripeService {
   }
 
   async getCharges(organizationId: string) {
+    if (!this.stripe) {
+      return [];
+    }
+
     const org = await this._organizationService.getOrgById(organizationId);
     if (!org?.paymentId) {
       return [];
     }
 
-    const charges = await stripe.charges.list({
+    const charges = await this.stripe.charges.list({
       customer: org.paymentId,
       limit: 100,
     });
@@ -878,6 +956,10 @@ export class StripeService {
   }
 
   async refundCharges(organizationId: string, chargeIds: string[]) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const org = await this._organizationService.getOrgById(organizationId);
     if (!org?.paymentId) {
       throw new Error('No payment customer found for this organization');
@@ -888,7 +970,7 @@ export class StripeService {
 
     for (const chargeId of chargeIds) {
       try {
-        await stripe.refunds.create({ charge: chargeId });
+        await this.stripe.refunds.create({ charge: chargeId });
         refunded.push(chargeId);
       } catch (err) {
         failed.push(chargeId);
@@ -899,6 +981,10 @@ export class StripeService {
   }
 
   async cancelSubscription(organizationId: string) {
+    if (!this.stripe) {
+      throw new Error('Stripe not initialized');
+    }
+
     const org = await this._organizationService.getOrgById(organizationId);
     if (!org?.paymentId) {
       throw new Error('No payment customer found for this organization');
@@ -907,7 +993,7 @@ export class StripeService {
     const customer = org.paymentId;
 
     const subscriptions = (
-      await stripe.subscriptions.list({
+      await this.stripe.subscriptions.list({
         customer,
         status: 'all',
       })
@@ -917,7 +1003,7 @@ export class StripeService {
       throw new Error('No active subscription found');
     }
 
-    await stripe.subscriptions.cancel(subscriptions[0].id);
+    await this.stripe.subscriptions.cancel(subscriptions[0].id);
     await this._subscriptionService.deleteSubscription(customer);
 
     return { cancelled: true };
